@@ -34,7 +34,7 @@ The workflow is divided into prior generation, data preprocessing, model trainin
 * **`In_Season_Dynamic_Crop_Mapping.py`**
   The core mapping engine. It performs large-scale inference by coupling the trained DS-Transformer outputs with the high-order Markov priors. It uses a linear fusion strategy and a `CropStateTracker` to dynamically update crop distributions.
 * **`Validation.py`**
-  Evaluates the mapping results against ground-truth validation shapefiles. It computes area-weighted metrics including Overall Accuracy (OA), Precision, Recall, F1-Score, coverage and generates step-by-step confusion matrices.
+  Evaluates the mapping results against ground-truth validation shapefiles. It computes area-weighted metrics including Overall Accuracy (OA), Precision, Recall, F1-Score, Kappa coefficient, coverage and generates step-by-step confusion matrices.
 
 ---
 
@@ -57,7 +57,7 @@ The workflow is divided into prior generation, data preprocessing, model trainin
 
 ## 📊 Expected Outputs
 - **Mapping Results**: A series of `.tif` files representing the in-season crop distributions.
-- **Accuracy Report**: A `.csv` containing OA, F1-Score, and Coverage for each tif.
+- **Accuracy Report**: A `.csv` containing OA, F1-Score, Kappa coefficient, and Coverage for each tif.
 
 
 *You can install the main dependencies via pip:*
