@@ -60,7 +60,7 @@ SPATIAL_WEIGHT_TEMPLATE = "Spatial_Weight_{year}.tif"
 
 NUM_CLASSES = 6
 AGRO_ID = 4
-SSCORN_ID = 1
+SCORN_ID = 1
 COTTON_ID = 0
 SWHEAT_ID = 2
 DWHEAT_ID = 3
@@ -171,12 +171,12 @@ class CropStateTracker:
             self.update_time[mask_valid_update] = k
 
 
-def linear_fusion(lstm_probs, prior_probs, time_weight, spatial_weight):
+def linear_fusion(tans_probs, prior_probs, time_weight, spatial_weight):
     w_prior = time_weight * spatial_weight
-    w_lstm = 1.0 - w_prior
-    w_lstm_expanded = w_lstm[..., np.newaxis]
+    w_tans = 1.0 - w_prior
+    w_tans_expanded = w_tans[..., np.newaxis]
     w_prior_expanded = w_prior[..., np.newaxis]
-    fused_unnormalized = (w_lstm_expanded * lstm_probs) + (w_prior_expanded * prior_probs)
+    fused_unnormalized = (w_tans_expanded * tans_probs) + (w_prior_expanded * prior_probs)
     sum_probs = np.sum(fused_unnormalized, axis=-1, keepdims=True) + 1e-9
     return fused_unnormalized / sum_probs
 
@@ -292,9 +292,9 @@ def process_year(year):
     start_time = time.time()
     print(f"\n🚀 Processing {year} (DS Transformer + Auto Resume)")
 
-    out_dir_no_prior = os.path.join(BASE_DIR, f"Steps_{year}_NoPrior_TransformerDS")
-    out_dir_prior = os.path.join(BASE_DIR, f"Steps_{year}_Prior_TransformerDS")
-    out_dir_rollback = os.path.join(BASE_DIR, f"Steps_{year}_Rollback_StatsTransformerDS")
+    out_dir_no_prior = os.path.join(BASE_DIR, f"Steps_{year}_NoPrior_DSTransformer")
+    out_dir_prior = os.path.join(BASE_DIR, f"Steps_{year}_Prior_DSTransformer")
+    out_dir_rollback = os.path.join(BASE_DIR, f"Steps_{year}_Rollback_StatsDSTransformer")
     os.makedirs(out_dir_no_prior, exist_ok=True)
     os.makedirs(out_dir_prior, exist_ok=True)
     os.makedirs(out_dir_rollback, exist_ok=True)
@@ -314,7 +314,7 @@ def process_year(year):
         year_config = PRIOR_CONFIG.get(year)
         prior_manager = PriorManager(year_config)
 
-    model_name = f"Final_Model_TransformerDS_{year}.pth"
+    model_name = f"Final_Model_DSTransformer_{year}.pth"
     model_path = os.path.join(MODEL_DIR, model_name)
     if not os.path.exists(model_path):
         print(f"⚠️ Model weight not found: {model_path}")
@@ -415,22 +415,22 @@ def process_year(year):
                         out_steps, out_final, _ = model_net(batch_in)
                         all_logits[i: i + INFERENCE_BATCH_SIZE] = out_steps[:, current_step_idx, :].cpu()
 
-                probs_lstm = F.softmax(all_logits, dim=1).numpy().reshape(win_h, win_w, NUM_CLASSES)
+                probs_tans = F.softmax(all_logits, dim=1).numpy().reshape(win_h, win_w, NUM_CLASSES)
                 valid_classes = get_valid_classes(k)
 
                 if GENERATE_NO_PRIOR:
-                    tracker_nop.update(k, probs_lstm.copy(), valid_classes)
+                    tracker_nop.update(k, probs_tans.copy(), valid_classes)
                     out_nop_data = np.stack([tracker_nop.current_class, tracker_nop.current_prob]).astype('float32')
                     files_nop[k].write(out_nop_data, window=window)
 
                 if GENERATE_WITH_PRIOR:
                     if k in PRIOR_INJECTION_STEPS:
                         w_current_linear = max(0.0, 1.0 - ((k - 1) / 17.0))
-                        lstm_max_conf = np.max(probs_lstm, axis=2)
+                        tans_max_conf = np.max(probs_tans, axis=2)
                         w_time_matrix = np.zeros((win_h, win_w), dtype=np.float32)
 
                         if 4 <= k <= 11:
-                            mask_high_conf = lstm_max_conf > 0.80
+                            mask_high_conf = tans_max_conf > 0.80
                             w_time_matrix[:] = w_current_linear
                             w_time_matrix[mask_high_conf] = 0.0
 
@@ -442,37 +442,37 @@ def process_year(year):
                         w_time_matrix[mask_stable_AGRO] = w_current_linear
 
                         if k <= 11:
-                            mask_zone_active = np.isin(zone_data, [2, 3]) if k == 6 else np.isin(zone_data,
+                            mask_zone_active = np.isin(zone_data, [2, 4]) if k == 6 else np.isin(zone_data,
                                                                                                  [1, 2, 3, 4])
                             w_time_matrix[(~mask_zone_active) & (~mask_stable_AGRO)] = 0.0
                         else:
                             w_time_matrix[~mask_stable_AGRO] = 0.0
 
-                        probs_fused = linear_fusion(probs_lstm, prior_map, w_time_matrix, sp_w_data)
+                        probs_fused = linear_fusion(probs_tans, prior_map, w_time_matrix, sp_w_data)
 
                         fused_pred_before_rb = np.argmax(probs_fused, axis=2)
                         fused_prob_before_rb = np.max(probs_fused, axis=2)
-                        lstm_pred = np.argmax(probs_lstm, axis=2)
+                        tans_pred = np.argmax(probs_tans, axis=2)
 
-                        mask_force_AGRO = mask_stable_AGRO & (lstm_pred != AGRO_ID) & (lstm_max_conf < 0.80)
+                        mask_force_AGRO = mask_stable_AGRO & (tans_pred != AGRO_ID) & (tans_max_conf < 0.80)
                         if np.any(mask_force_AGRO):
                             probs_fused[mask_force_AGRO, :] = 0.0
                             probs_fused[mask_force_AGRO, AGRO_ID] = 1.0
 
                         fused_pred = np.argmax(probs_fused, axis=2)
-                        diff = np.max(probs_fused, axis=2) - np.max(probs_lstm, axis=2)
+                        diff = np.max(probs_fused, axis=2) - np.max(probs_tans, axis=2)
 
-                        mask_rollback_A = (lstm_pred == SSCORN_ID) & (fused_pred == COTTON_ID) & (diff <= 0.30)
-                        mask_w_swap = ((lstm_pred == 2) & (fused_pred == 3)) | ((lstm_pred == 3) & (fused_pred == 2))
-                        mask_rollback_C = mask_w_swap & (diff <= 0.10)
-                        mask_handled = ((lstm_pred == SCORN_ID) & (fused_pred == COTTON_ID)) | \
-                                       ((lstm_pred == OTHER_ID) & ((fused_pred == 2) | (fused_pred == 3))) | \
-                                       mask_w_swap | (((lstm_pred == 2) | (lstm_pred == 3)) & (fused_pred == 4))
-                        mask_rollback_E = (lstm_pred != fused_pred) & (~mask_handled) & (diff <= 0.10)
+                        mask_rollback_A = (tans_pred == SCORN_ID) & (fused_pred == COTTON_ID) & (diff <= 0.30)
+                        mask_w_swap = ((tans_pred == 2) & (fused_pred == 3)) | ((tans_pred == 3) & (fused_pred == 2))
+                        mask_rollback_C = mask_w_swap & (diff <= 0.12)
+                        mask_handled = ((tans_pred == SCORN_ID) & (fused_pred == COTTON_ID)) | \
+                                       ((tans_pred == OTHER_ID) & ((fused_pred == 2) | (fused_pred == 3))) | \
+                                       mask_w_swap | (((tans_pred == 2) | (tans_pred == 3)) & (fused_pred == 4))
+                        mask_rollback_E = (tans_pred != fused_pred) & (~mask_handled) & (diff <= 0.12)
 
                         mask_rollback_all = mask_rollback_A | mask_rollback_C | mask_rollback_E
                         if np.any(mask_rollback_all):
-                            probs_fused[mask_rollback_all] = probs_lstm[mask_rollback_all]
+                            probs_fused[mask_rollback_all] = probs_tans[mask_rollback_all]
 
                         total_rb_mask = mask_rollback_all
 
@@ -480,15 +480,15 @@ def process_year(year):
                             out_rb = np.zeros((5, win_h, win_w), dtype=np.float32)
                             out_rb[0, total_rb_mask] = 1.0
                             out_rb[1, total_rb_mask] = fused_pred_before_rb[total_rb_mask]
-                            out_rb[2, total_rb_mask] = lstm_pred[total_rb_mask]
+                            out_rb[2, total_rb_mask] = tans_pred[total_rb_mask]
                             out_rb[3, total_rb_mask] = fused_prob_before_rb[total_rb_mask]
-                            out_rb[4, total_rb_mask] = lstm_max_conf[total_rb_mask]
+                            out_rb[4, total_rb_mask] = tans_max_conf[total_rb_mask]
                             files_rb[k].write(out_rb, window=window)
                             del out_rb
 
                         probs_for_update = probs_fused
                     else:
-                        probs_for_update = probs_lstm.copy()
+                        probs_for_update = probs_tans.copy()
 
                     probs_for_update[~pixel_mask] = 0
                     tracker_pri.update(k, probs_for_update, valid_classes)

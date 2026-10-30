@@ -1,4 +1,5 @@
 import os
+import glob
 import math
 import numpy as np
 import torch
@@ -10,18 +11,19 @@ import itertools
 import time
 import torch.nn.functional as F
 
-# ================= ⚙️ CONFIGURATION =================
+# ================= CONFIGURATION =================
 DATA_ROOT = r"D:\Inseason_mapping"
 FILE_SUFFIX = "_GlobalNorm"
+META_SUFFIX = FILE_SUFFIX  # spatial block split is stored in Meta_{year}{META_SUFFIX}.csv
 MODEL_SAVE_DIR = r"D:\Inseason_mapping\Tuning"
 os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
 
-RESULT_CSV_PATH = os.path.join(MODEL_SAVE_DIR, "Tuning_Results_TransformerDS.csv")
+RESULT_CSV_PATH = os.path.join(MODEL_SAVE_DIR, "Tuning_Results_DSTransformer.csv")
 
-# 🔥 [FEATURE SELECTION]
+# [FEATURE SELECTION]
 SELECTED_FEATURES = [0, 1, 2, 3, 4, 5, 6]
 INPUT_FEATURES = len(SELECTED_FEATURES)
-print(f"🔧 Feature config: Retaining indices {SELECTED_FEATURES} (Input Dim={INPUT_FEATURES})")
+print(f"Feature config: Retaining indices {SELECTED_FEATURES} (Input Dim={INPUT_FEATURES})")
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {DEVICE}")
@@ -46,7 +48,7 @@ NUM_CLASSES = 6
 WARMUP_EPOCHS = 10
 
 
-# ================= 🧠 MODEL DEFINITION (PURE TRANSFORMER) =================
+# ================= MODEL DEFINITION (PURE TRANSFORMER) =================
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=5000):
         super(PositionalEncoding, self).__init__()
@@ -135,8 +137,60 @@ class CropDataset(Dataset):
         return x, y
 
 
-# ================= 📥 DATA LOADING LOGIC =================
+# ================= DATA LOADING LOGIC =================
 ALL_DATA_CACHE = {}
+
+
+def locate_meta_file(year):
+    """Resolve the Meta csv that carries the spatial block split."""
+    expected = os.path.join(DATA_ROOT, f"Meta_{year}{META_SUFFIX}.csv")
+    if os.path.exists(expected):
+        return expected
+
+    candidates = sorted(glob.glob(os.path.join(DATA_ROOT, f"Meta_{year}_*.csv")))
+    if len(candidates) == 1:
+        print(f"  [WARN] {os.path.basename(expected)} not found, falling back to "
+              f"{os.path.basename(candidates[0])}")
+        return candidates[0]
+
+    raise FileNotFoundError(
+        f"Spatial split metadata missing for {year}. Expected {expected}. "
+        f"Without it the spatial block hold-out would be silently discarded."
+    )
+
+
+def load_split_flags(year, y, n_rows):
+    """Read the Train/Val block assignment and verify it matches the arrays."""
+    meta_path = locate_meta_file(year)
+    meta = pd.read_csv(meta_path)
+
+    if len(meta) != n_rows:
+        raise ValueError(
+            f"Row mismatch for {year}: Meta has {len(meta)} rows but y has {n_rows}. "
+            f"Metadata and arrays do not come from the same extraction run."
+        )
+
+    if 'Label' in meta.columns:
+        if not np.array_equal(meta['Label'].to_numpy(), np.asarray(y)):
+            raise ValueError(
+                f"Label column in {os.path.basename(meta_path)} does not match y_{year}. "
+                f"Unique labels in meta: {np.unique(meta['Label'].to_numpy())}, in y: {np.unique(y)}."
+            )
+
+    if 'split' not in meta.columns:
+        raise ValueError(f"'split' column not found in {os.path.basename(meta_path)}.")
+
+    split = meta['split'].astype(str).str.strip().str.lower().to_numpy()
+    unknown = set(np.unique(split)) - {'train', 'val'}
+    if unknown:
+        raise ValueError(f"Unexpected split values in {os.path.basename(meta_path)}: {sorted(unknown)}")
+
+    is_train = split == 'train'
+    is_val = split == 'val'
+    if is_train.sum() == 0 or is_val.sum() == 0:
+        raise ValueError(f"Empty split for {year}: train={int(is_train.sum())}, val={int(is_val.sum())}")
+
+    return is_train, is_val
 
 
 def preload_all_years():
@@ -144,35 +198,42 @@ def preload_all_years():
     for t in TASKS:
         years_needed.add(t['target'])
         years_needed.update(t['train_years'])
-    print(f"⏳ Preloading data ...")
-    for year in years_needed:
+    print(f"Preloading data ...")
+    for year in sorted(years_needed):
         x_p = os.path.join(DATA_ROOT, f"X_{year}{FILE_SUFFIX}.npy")
         y_p = os.path.join(DATA_ROOT, f"y_{year}{FILE_SUFFIX}.npy")
-        if os.path.exists(x_p) and os.path.exists(y_p):
-            X = np.load(x_p)
-            y = np.load(y_p)
-            X = np.nan_to_num(X, nan=0.0)
+        if not (os.path.exists(x_p) and os.path.exists(y_p)):
+            raise FileNotFoundError(f"Missing arrays for {year}: {x_p} / {y_p}")
 
-            if X.shape[1] <= 12 and X.shape[2] > 12:
-                if X.shape[1] > INPUT_FEATURES: X = X[:, SELECTED_FEATURES, :]
-                X = X.transpose(0, 2, 1)
-            elif X.shape[1] > 12 and X.shape[2] <= 12:
-                if X.shape[2] > INPUT_FEATURES: X = X[:, :, SELECTED_FEATURES]
+        X = np.load(x_p)
+        y = np.load(y_p).astype(np.int64)
+        X = np.nan_to_num(X, nan=0.0)
 
-            if X.shape[1] > 18: X = X[:, :18, :]
+        if X.shape[1] <= 12 and X.shape[2] > 12:
+            if X.shape[1] > INPUT_FEATURES: X = X[:, SELECTED_FEATURES, :]
+            X = X.transpose(0, 2, 1)
+        elif X.shape[1] > 12 and X.shape[2] <= 12:
+            if X.shape[2] > INPUT_FEATURES: X = X[:, :, SELECTED_FEATURES]
 
-            ALL_DATA_CACHE[year] = (X, y)
-            print(f"  ✅ Loaded {year}: {X.shape}")
-        else:
-            print(f"❌ Missing: {x_p}")
+        if X.shape[1] > 18: X = X[:, :18, :]
+
+        is_train, is_val = load_split_flags(year, y, len(y))
+
+        ALL_DATA_CACHE[year] = (X, y, is_train, is_val)
+        print(f"  Loaded {year}: {X.shape} | train blocks {int(is_train.sum())} px | val blocks {int(is_val.sum())} px")
 
 
-def perform_stratified_sampling(X, y, samples_per_class, seed_offset=0):
+def perform_stratified_sampling(X, y, samples_per_class, seed_offset=0, mask=None):
     X_res, y_res = [], []
     for cls_id in range(NUM_CLASSES):
-        indices = np.where(y == cls_id)[0]
+        if mask is None:
+            indices = np.where(y == cls_id)[0]
+        else:
+            indices = np.where(mask & (y == cls_id))[0]
         if len(indices) == 0: continue
         current_samples = min(len(indices), samples_per_class)
+        if current_samples < samples_per_class:
+            print(f"  [WARN] class {cls_id} has only {len(indices)} samples (< {samples_per_class})")
         np.random.seed(seed_offset + cls_id)
         selected_idx = np.random.choice(indices, current_samples, replace=False)
         X_res.append(X[selected_idx])
@@ -181,50 +242,61 @@ def perform_stratified_sampling(X, y, samples_per_class, seed_offset=0):
     return np.concatenate(X_res), np.concatenate(y_res)
 
 
+def split_val_test_blocks(X_blk, y_blk, target):
+    """Per-class disjoint draw from validation blocks: first the reporting set, then the dev set."""
+    X_eval, y_eval, X_dev, y_dev = [], [], [], []
+    for cls_id in range(NUM_CLASSES):
+        indices = np.where(y_blk == cls_id)[0]
+        if len(indices) == 0:
+            print(f"  [WARN] no validation-block samples for class {cls_id}")
+            continue
+        np.random.seed(target + cls_id + 42)
+        np.random.shuffle(indices)
+
+        eval_idx = indices[:min(SAMPLES_PER_CLASS_TEST, len(indices))]
+        rest = indices[eval_idx.size:]
+        dev_idx = rest[:min(SAMPLES_PER_CLASS_VAL, rest.size)]
+
+        if eval_idx.size < SAMPLES_PER_CLASS_TEST:
+            print(f"  [WARN] class {cls_id} has only {len(indices)} validation-block samples "
+                  f"(< {SAMPLES_PER_CLASS_TEST} required by the paper protocol)")
+
+        X_eval.append(X_blk[eval_idx]); y_eval.append(y_blk[eval_idx])
+        if dev_idx.size > 0:
+            X_dev.append(X_blk[dev_idx]); y_dev.append(y_blk[dev_idx])
+
+    if not X_eval:
+        return None, None, None, None
+    return np.concatenate(X_eval), np.concatenate(y_eval), np.concatenate(X_dev), np.concatenate(y_dev)
+
+
 def get_data_pooled_stratified(task_config):
     train_years = task_config['train_years']
     X_pool_list, y_pool_list = [], []
     for yr in train_years:
         if yr in ALL_DATA_CACHE:
-            X_pool_list.append(ALL_DATA_CACHE[yr][0])
-            y_pool_list.append(ALL_DATA_CACHE[yr][1])
+            X_y, y_y, is_train, _ = ALL_DATA_CACHE[yr]
+            X_pool_list.append(X_y[is_train])   # training blocks only
+            y_pool_list.append(y_y[is_train])
 
     if not X_pool_list: return None, None, None, None, None, None
     X_pool = np.concatenate(X_pool_list)
     y_pool = np.concatenate(y_pool_list)
 
-    X_train_final, y_train_final, X_val_final, y_val_final = [], [], [], []
-    for cls_id in range(NUM_CLASSES):
-        indices = np.where(y_pool == cls_id)[0]
-        if len(indices) == 0: continue
-        np.random.seed(task_config['target'] + cls_id + 42)
-        np.random.shuffle(indices)
-
-        n_train = SAMPLES_PER_CLASS_TRAIN
-        n_val = SAMPLES_PER_CLASS_VAL
-        if len(indices) < (n_train + n_val):
-            n_train = int(len(indices) * 0.6)
-            n_val = len(indices) - n_train
-
-        train_idx = indices[:n_train]
-        val_idx = indices[n_train: n_train + n_val]
-
-        X_train_final.append(X_pool[train_idx])
-        y_train_final.append(y_pool[train_idx])
-        X_val_final.append(X_pool[val_idx])
-        y_val_final.append(y_pool[val_idx])
-
-    X_train = np.concatenate(X_train_final)
-    y_train = np.concatenate(y_train_final)
-    X_val = np.concatenate(X_val_final)
-    y_val = np.concatenate(y_val_final)
+    X_train, y_train = perform_stratified_sampling(
+        X_pool, y_pool, SAMPLES_PER_CLASS_TRAIN, seed_offset=task_config['target'] + 42
+    )
+    if len(y_train) == 0: return None, None, None, None, None, None
 
     tgt = task_config['target']
     if tgt in ALL_DATA_CACHE:
-        X_test_raw, y_test_raw = ALL_DATA_CACHE[tgt]
-        X_test, y_test = perform_stratified_sampling(X_test_raw, y_test_raw, SAMPLES_PER_CLASS_TEST, seed_offset=9999)
+        X_tgt, y_tgt, _, is_val = ALL_DATA_CACHE[tgt]
+        X_test, y_test, X_val, y_val = split_val_test_blocks(X_tgt[is_val], y_tgt[is_val], tgt)
+        if X_val is None or len(y_val) == 0:
+            print("  [WARN] no disjoint dev samples left, reusing the evaluation set for early stopping")
+            X_val, y_val = X_test, y_test
     else:
-        X_test, y_test = np.array([]), np.array([])
+        X_test, y_test, X_val, y_val = np.array([]), np.array([]), np.array([]), np.array([])
 
     return X_train, y_train, X_val, y_val, X_test, y_test
 
@@ -242,7 +314,7 @@ def evaluate_accuracy(model, dataloader):
     return (correct / total * 100) if total > 0 else 0
 
 
-# ================= 🚀 TRAINING AND EVALUATION =================
+# ================= TRAINING AND EVALUATION =================
 def train_and_eval(params, X_train, y_train, X_val, y_val, X_test, y_test):
     train_ds = CropDataset(X_train, y_train, is_training=True)
     val_ds = CropDataset(X_val, y_val, is_training=False)
@@ -288,7 +360,7 @@ def train_and_eval(params, X_train, y_train, X_val, y_val, X_test, y_test):
                 pred_t = out_steps[:, t, :]
                 raw_loss_vec = criterion_train(pred_t, y_b)
 
-                if t < 10:
+                if t < 11:
                     mask = torch.isin(y_b, VALID_EARLY_CLASSES)
                     step_loss = (raw_loss_vec * mask.float()).sum() / (
                                 mask.sum() + 1e-6) if mask.sum() > 0 else torch.tensor(0.0, device=DEVICE)
@@ -315,7 +387,9 @@ def train_and_eval(params, X_train, y_train, X_val, y_val, X_test, y_test):
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             no_improve_epoch = 0
-            best_weights = model.state_dict()
+            # state_dict() holds references to the live parameters, which optimizer.step()
+            # mutates in place; a detached clone is required for the snapshot to persist.
+            best_weights = {k: v.detach().clone() for k, v in model.state_dict().items()}
         else:
             if not is_warmup: no_improve_epoch += 1
 
@@ -326,7 +400,7 @@ def train_and_eval(params, X_train, y_train, X_val, y_val, X_test, y_test):
     return final_train_loss, best_val_acc, test_acc
 
 
-# ================= 📊 GRID SEARCH AND RESUME =================
+# ================= GRID SEARCH AND RESUME =================
 def load_existing_results():
     if os.path.exists(RESULT_CSV_PATH):
         try:
@@ -360,7 +434,7 @@ if __name__ == "__main__":
     try:
         preload_all_years()
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"Error: {e}")
         exit()
 
     keys, values = zip(*PARAM_GRID.items())
@@ -381,14 +455,14 @@ if __name__ == "__main__":
             X_tr, y_tr, X_val, y_val, X_te, y_te = get_data_pooled_stratified(task)
             if X_tr is None: valid_run = False; break
 
-            if len(y_te) == 0: print(f"⚠️ Warning: Test set is empty for task {task['target']}")
+            if len(y_te) == 0: print(f"  [WARN] Test set is empty for task {task['target']}")
             final_loss, best_val, test_acc = train_and_eval(params, X_tr, y_tr, X_val, y_val, X_te, y_te)
 
             res[f'Train_Loss_{task["target"]}'] = final_loss
             res[f'Val_Acc_{task["target"]}'] = best_val
             res[f'Test_Acc_{task["target"]}'] = test_acc
             test_scores.append(test_acc)
-            print(f"  👉 {task['target']} | Loss: {final_loss:.4f} | Val: {best_val:.2f}% | Test: {test_acc:.2f}%")
+            print(f"  {task['target']} | Loss: {final_loss:.4f} | Val: {best_val:.2f}% | Test: {test_acc:.2f}%")
 
         if valid_run:
             final_score = test_scores[0]
@@ -413,8 +487,8 @@ if __name__ == "__main__":
             else:
                 new_df.to_csv(RESULT_CSV_PATH, mode='w', header=True, index=False)
             elapsed = time.time() - start_time
-            print(f"  ✅ Result: {final_score:.2f}%. (Elapsed: {elapsed / 60:.1f}m)")
+            print(f"  Result: {final_score:.2f}%. (Elapsed: {elapsed / 60:.1f}m)")
         else:
-            print("  ❌ Failed.")
+            print("  Failed.")
 
-    print(f"\n🎉 All Tuning Done! Grid Results Saved to: {RESULT_CSV_PATH}")
+    print(f"\nAll Tuning Done! Grid Results Saved to: {RESULT_CSV_PATH}")

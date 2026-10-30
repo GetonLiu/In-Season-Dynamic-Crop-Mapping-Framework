@@ -51,12 +51,7 @@ def calculate_complexity_weight(y1, y2, y3, y4):
     Agroforestry_cnt = (is_Agro_1.astype(np.int8) + is_Agro_2.astype(np.int8) +
                    is_Agro_3.astype(np.int8) + is_Agro_4.astype(np.int8))
 
-    rule_freq = (Agroforestry_cnt >= 3)
-    rule_new_continuous = is_Agro_3 & is_Agro_4
-    rule_gap_1 = is_Agro_2 & is_Agro_4
-    rule_gap_2 = is_Agro_1 & is_Agro_3
-
-    mask_Agroforestry_priority = rule_freq | rule_new_continuous | rule_gap_1 | rule_gap_2
+    mask_Agroforestry_priority = (Agroforestry_cnt >= 3) & is_Agro_4
     weights[mask_Agroforestry_priority] = WEIGHT_Agroforestry_FORCE
 
     # --- Step 3: Handle NoData ---

@@ -1,4 +1,5 @@
 import os
+import glob
 import math
 import numpy as np
 import pandas as pd
@@ -8,9 +9,10 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-# ================= ⚙️ 1. GLOBAL CONFIGURATION =================
+# ================= 1. GLOBAL CONFIGURATION =================
 DATA_ROOT = r"D:\Inseason_mapping"
 FILE_SUFFIX = "_GlobalNorm"
+META_SUFFIX = FILE_SUFFIX  # spatial block split lives in Meta_{year}{META_SUFFIX}.csv
 MODEL_SAVE_DIR = r"D:\Inseason_mapping"
 STATS_SAVE_DIR = r"D:\Inseason_mapping\Training_Stats"
 os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
@@ -18,12 +20,12 @@ os.makedirs(STATS_SAVE_DIR, exist_ok=True)
 
 MODE_SWITCH = "ALL"
 
-# 🔥 [FEATURE SELECTION]
+# [FEATURE SELECTION]
 SELECTED_FEATURES = [0, 1, 2, 3, 4, 5, 6]
 INPUT_FEATURES = len(SELECTED_FEATURES)
-print(f"🔧 Feature Configuration: {SELECTED_FEATURES} (Input Dim={INPUT_FEATURES})")
+print(f"Feature Configuration: {SELECTED_FEATURES} (Input Dim={INPUT_FEATURES})")
 
-# 🔥🔥🔥 [MODEL HYPERPARAMETERS] 🔥🔥🔥
+# [MODEL HYPERPARAMETERS]
 
 HIDDEN_DIM = 128
 NUM_LAYERS = 1
@@ -54,7 +56,7 @@ TASKS = {
 CLASS_NAMES = ['Cotton', 'SCorn', 'SWheat', 'DWheat', 'Agroforestry', 'Other']
 
 
-# ================= 🧠 2. MODEL AND LOSS =================
+# ================= 2. MODEL AND LOSS =================
 class FocalLoss(nn.Module):
     def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
         super(FocalLoss, self).__init__()
@@ -73,7 +75,7 @@ class FocalLoss(nn.Module):
         return focal_loss
 
 
-# ================= 🧠 MODEL DEFINITION (PURE TRANSFORMER, ADDED POSITIONAL ENCODING) =================
+# ================= MODEL DEFINITION (PURE TRANSFORMER, ADDED POSITIONAL ENCODING) =================
 class PositionalEncoding(nn.Module):
     """Standard sine-wave positional encoding"""
 
@@ -179,24 +181,91 @@ def evaluate_and_stats(model, dataloader, criterion):
     return avg_loss, acc, avg_attn
 
 
-def load_data_list(years, sample_limit=None, seed_base=0):
+# ================= 3. SPATIAL BLOCK SPLIT =================
+_SPLIT_CACHE = {}
+
+
+def locate_meta_file(year):
+    """Resolve the Meta csv that carries the spatial block split."""
+    expected = os.path.join(DATA_ROOT, f"Meta_{year}{META_SUFFIX}.csv")
+    if os.path.exists(expected):
+        return expected
+
+    candidates = sorted(glob.glob(os.path.join(DATA_ROOT, f"Meta_{year}_*.csv")))
+    if len(candidates) == 1:
+        print(f"  [WARN] {os.path.basename(expected)} not found, falling back to "
+              f"{os.path.basename(candidates[0])}")
+        return candidates[0]
+
+    raise FileNotFoundError(
+        f"Spatial split metadata missing for {year}. Expected {expected}. "
+        f"Without it the spatial block hold-out would be silently discarded."
+    )
+
+
+def get_block_mask(year, y, block):
+    """Boolean mask of the requested spatial block type ('train' or 'val')."""
+    if year not in _SPLIT_CACHE:
+        meta_path = locate_meta_file(year)
+        meta = pd.read_csv(meta_path)
+
+        if len(meta) != len(y):
+            raise ValueError(
+                f"Row mismatch for {year}: Meta has {len(meta)} rows but y has {len(y)}. "
+                f"Metadata and arrays do not come from the same extraction run."
+            )
+        if 'Label' in meta.columns and not np.array_equal(meta['Label'].to_numpy(), np.asarray(y)):
+            raise ValueError(f"Label column in {os.path.basename(meta_path)} does not match y_{year}.")
+        if 'split' not in meta.columns:
+            raise ValueError(f"'split' column not found in {os.path.basename(meta_path)}.")
+
+        split = meta['split'].astype(str).str.strip().str.lower().to_numpy()
+        unknown = set(np.unique(split)) - {'train', 'val'}
+        if unknown:
+            raise ValueError(f"Unexpected split values in {os.path.basename(meta_path)}: {sorted(unknown)}")
+
+        is_train, is_val = split == 'train', split == 'val'
+        if is_train.sum() == 0 or is_val.sum() == 0:
+            raise ValueError(f"Empty split for {year}: train={int(is_train.sum())}, val={int(is_val.sum())}")
+        _SPLIT_CACHE[year] = (is_train, is_val)
+
+    is_train, is_val = _SPLIT_CACHE[year]
+    return is_train if block == 'train' else is_val
+
+
+def _load_year(yr, block=None):
+    xp = os.path.join(DATA_ROOT, f"X_{yr}{FILE_SUFFIX}.npy")
+    yp = os.path.join(DATA_ROOT, f"y_{yr}{FILE_SUFFIX}.npy")
+    if not (os.path.exists(xp) and os.path.exists(yp)):
+        return None, None
+
+    xt, yt = np.load(xp), np.load(yp).astype(np.int64)
+    xt = np.nan_to_num(xt, nan=0.0)
+
+    if xt.shape[1] <= 12 and xt.shape[2] > 12:
+        if xt.shape[1] > INPUT_FEATURES: xt = xt[:, SELECTED_FEATURES, :]
+        xt = xt.transpose(0, 2, 1)
+    elif xt.shape[1] > 12 and xt.shape[2] <= 12:
+        if xt.shape[2] > INPUT_FEATURES: xt = xt[:, :, SELECTED_FEATURES]
+
+    if xt.shape[1] > 18: xt = xt[:, :18, :]
+
+    if block is not None:
+        mask = get_block_mask(yr, yt, block)
+        xt, yt = xt[mask], yt[mask]
+
+    return xt, yt
+
+
+def load_data_list(years, sample_limit=None, seed_base=0, block='train'):
     X_list, y_list = [], []
     for yr in years:
-        xp = os.path.join(DATA_ROOT, f"X_{yr}{FILE_SUFFIX}.npy")
-        yp = os.path.join(DATA_ROOT, f"y_{yr}{FILE_SUFFIX}.npy")
-        if os.path.exists(xp) and os.path.exists(yp):
-            xt, yt = np.load(xp), np.load(yp)
-            xt = np.nan_to_num(xt, nan=0.0)
-
-            if xt.shape[1] <= 12 and xt.shape[2] > 12:
-                if xt.shape[1] > INPUT_FEATURES: xt = xt[:, SELECTED_FEATURES, :]
-                xt = xt.transpose(0, 2, 1)
-            elif xt.shape[1] > 12 and xt.shape[2] <= 12:
-                if xt.shape[2] > INPUT_FEATURES: xt = xt[:, :, SELECTED_FEATURES]
-
-            if xt.shape[1] > 18: xt = xt[:, :18, :]
-            X_list.append(xt)
-            y_list.append(yt)
+        xt, yt = _load_year(yr, block=block)
+        if xt is None:
+            print(f"  [WARN] missing arrays for {yr}")
+            continue
+        X_list.append(xt)
+        y_list.append(yt)
 
     if not X_list: return None, None
     X_pool, y_pool = np.concatenate(X_list), np.concatenate(y_list)
@@ -216,42 +285,73 @@ def load_data_list(years, sample_limit=None, seed_base=0):
     return X_out[p], y_out[p]
 
 
-def prepare_datasets(target_year, train_years):
-    print(f"\n📂 Loading Train/Val {train_years}...")
-    X_pool, y_pool = load_data_list(train_years)
+def load_val_test_split(target_year):
+    """Disjoint per-class draws from the target year's validation blocks."""
+    xt, yt = _load_year(target_year, block='val')
+    if xt is None:
+        raise FileNotFoundError(f"Missing arrays for target year {target_year}")
 
-    X_tr, y_tr, X_val, y_val = [], [], [], []
+    X_val, y_val, X_test, y_test = [], [], [], []
+    for cls_id in range(NUM_CLASSES):
+        idx = np.where(yt == cls_id)[0]
+        if len(idx) == 0:
+            print(f"  [WARN] no validation-block samples for class {cls_id}")
+            continue
+        np.random.seed(target_year + cls_id + 7)
+        np.random.shuffle(idx)
+
+        val_idx = idx[:min(SAMPLES_PER_CLASS_VAL, len(idx))]
+        rest = idx[val_idx.size:]
+        test_idx = rest[:min(SAMPLES_PER_CLASS_TEST, rest.size)]
+
+        X_val.append(xt[val_idx]); y_val.append(yt[val_idx])
+        if test_idx.size > 0:
+            X_test.append(xt[test_idx]); y_test.append(yt[test_idx])
+
+    if not X_val or not X_test:
+        raise ValueError(f"Validation blocks of {target_year} are too small to build val/test sets")
+
+    X_val, y_val = np.concatenate(X_val), np.concatenate(y_val)
+    X_test, y_test = np.concatenate(X_test), np.concatenate(y_test)
+
+    p1 = np.random.permutation(len(y_val))
+    X_val, y_val = X_val[p1], y_val[p1]
+    p2 = np.random.permutation(len(y_test))
+    X_test, y_test = X_test[p2], y_test[p2]
+    return X_val, y_val, X_test, y_test
+
+
+def prepare_datasets(target_year, train_years):
+    print(f"\nLoading Train {train_years} (training blocks only)...")
+    X_pool, y_pool = load_data_list(train_years, block='train')
+    if X_pool is None:
+        return None, None, None, None, None, None
+
+    X_tr, y_tr = [], []
     for cls_id in range(NUM_CLASSES):
         idx = np.where(y_pool == cls_id)[0]
+        if len(idx) == 0: continue
         np.random.seed(target_year + cls_id)
         np.random.shuffle(idx)
 
-        n_train, n_val = SAMPLES_PER_CLASS_TRAIN, SAMPLES_PER_CLASS_VAL
-        if len(idx) < (n_train + n_val):
-            n_train = int(len(idx) * 0.7)
-            n_val = len(idx) - n_train
-
+        n_train = min(SAMPLES_PER_CLASS_TRAIN, len(idx))
         X_tr.append(X_pool[idx[:n_train]])
         y_tr.append(y_pool[idx[:n_train]])
-        X_val.append(X_pool[idx[n_train:n_train + n_val]])
-        y_val.append(y_pool[idx[n_train:n_train + n_val]])
 
     X_train, y_train = np.concatenate(X_tr), np.concatenate(y_tr)
-    X_val, y_val = np.concatenate(X_val), np.concatenate(y_val)
-
     p1 = np.random.permutation(len(y_train))
     X_train, y_train = X_train[p1], y_train[p1]
-    p2 = np.random.permutation(len(y_val))
-    X_val, y_val = X_val[p2], y_val[p2]
 
-    print(f"📂 Loading Test {target_year}...")
-    X_test, y_test = load_data_list([target_year], sample_limit=SAMPLES_PER_CLASS_TEST, seed_base=999)
+    print(f"Loading Val/Test {target_year} (validation blocks only)...")
+    X_val, y_val, X_test, y_test = load_val_test_split(target_year)
+
+    print(f"  Train {len(y_train)} | Val {len(y_val)} | Test {len(y_test)}")
     return X_train, y_train, X_val, y_val, X_test, y_test
 
 
-# ================= 🚀 STEP-BY-STEP DYNAMIC EVALUATION FUNCTION =================
+# ================= 4. STEP-BY-STEP DYNAMIC EVALUATION FUNCTION =================
 def evaluate_step_by_step(model, dataloader, target_year):
-    print(f"\n📊 Performing Step-by-Step Evaluation for year {target_year}...")
+    print(f"\nPerforming Step-by-Step Evaluation for year {target_year}...")
     model.eval()
 
     step_valid_classes = {
@@ -261,7 +361,7 @@ def evaluate_step_by_step(model, dataloader, target_year):
     }
 
     with torch.no_grad():
-        for step in range(4, 19):
+        for step in range(3, 17):
             valid_classes = step_valid_classes.get(step, [0, 1, 2, 3, 4, 5])
             valid_tensor = torch.tensor(valid_classes, device=DEVICE)
 
@@ -321,10 +421,10 @@ def evaluate_step_by_step(model, dataloader, target_year):
                     display_classes.append(CLASS_NAMES[c])
 
             class_names_str = ",".join(display_classes)
-            print(f"⏱️ Step {step:02d} | [{class_names_str}] | Evaluation Base: {total} | OA: {acc:.2f}%")
+            print(f"Step {step:02d} | [{class_names_str}] | Evaluation Base: {total} | OA: {acc:.2f}%")
 
 
-# ================= 🚀 MAIN TRAINING LOGIC =================
+# ================= 5. MAIN TRAINING LOGIC =================
 def train_final_model(target_year):
     train_years = TASKS[target_year]
     X_train, y_train, X_val, y_val, X_test, y_test = prepare_datasets(target_year, train_years)
@@ -347,13 +447,13 @@ def train_final_model(target_year):
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.5)
 
     best_acc, best_epoch = 0.0, 0
-    best_path = os.path.join(MODEL_SAVE_DIR, f"Final_Model_TransformerDS_{target_year}.pth")
+    best_path = os.path.join(MODEL_SAVE_DIR, f"Final_Model_DSTransformer_{target_year}.pth")
 
     VALID_EARLY_CLASSES = torch.tensor([0, 1, 2, 4, 5], device=DEVICE)
     training_history = []
 
     # =========================================================
-    # 🔥 TIME DECAY WEIGHTS (PRE-COMPUTED)
+    # TIME DECAY WEIGHTS (PRE-COMPUTED)
     # =========================================================
     BETA = 0.3
     steps_tensor = torch.arange(0, 14, device=DEVICE).float()
@@ -373,12 +473,12 @@ def train_final_model(target_year):
             out_steps, out_final, _ = model(X_b)
 
             step_losses_early = []
-            for idx, t in enumerate(range(3, 17)):
+            for idx, t in enumerate(range(4, 18)):
                 if t < out_steps.shape[1]:
                     pred_t = out_steps[:, t, :]
                     raw_loss_vec = criterion_train(pred_t, y_b)
 
-                    if t < 10:
+                    if t < 12:
                         mask = torch.isin(y_b, VALID_EARLY_CLASSES)
                         step_loss = (raw_loss_vec * mask.float()).sum() / (
                                 mask.sum() + 1e-6) if mask.sum() > 0 else torch.tensor(0.0, device=DEVICE)
@@ -412,10 +512,10 @@ def train_final_model(target_year):
         if not is_warmup and val_acc > best_acc:
             best_acc, best_epoch = val_acc, epoch + 1
             torch.save(model.state_dict(), best_path)
-            save_msg = "🏆 BEST"
+            save_msg = "BEST"
 
         if (epoch + 1) % PRINT_INTERVAL == 0 or save_msg:
-            status = "🔥" if is_warmup else "🛡️"
+            status = "WARMUP" if is_warmup else "TRAIN"
             print(
                 f"Ep {epoch + 1:03d} [{status}] Loss:{train_loss:.4f} Tr:{train_acc:.1f}% Val:{val_acc:.2f}% {save_msg}")
 
@@ -426,9 +526,9 @@ def train_final_model(target_year):
         for i in range(len(avg_attn)): epoch_record[f'Attn_Step_{i + 1}'] = round(float(avg_attn[i]), 4)
         training_history.append(epoch_record)
 
-    print(f"\n🎉 Done {target_year}. Best Val Acc: {best_acc:.2f}% (Ep {best_epoch})")
+    print(f"\nDone {target_year}. Best Val Acc: {best_acc:.2f}% (Ep {best_epoch})")
     history_df = pd.DataFrame(training_history)
-    history_csv_path = os.path.join(STATS_SAVE_DIR, f"Training_History_TransformerDS_{target_year}.csv")
+    history_csv_path = os.path.join(STATS_SAVE_DIR, f"Training_History_DSTransformer_{target_year}.csv")
     history_df.to_csv(history_csv_path, index=False)
 
     if os.path.exists(best_path):

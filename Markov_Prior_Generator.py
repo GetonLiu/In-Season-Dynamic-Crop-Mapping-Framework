@@ -5,11 +5,12 @@ import pandas as pd
 
 # ===================== CONFIGURATION: PATHS & PARAMS =====================
 DATA_ROOT = r"D:\Inseason_mapping"
+RF_DATA_ROOT = r"D:\Inseason_mapping"
 OUTPUT_DIR = r"D:\Inseason_mapping"
 
 # Input templates and zone file
 RF_FILE_TEMPLATE = "Export_RF_Map_{year}.tif"
-ZONE_FILE = os.path.join(DATA_ROOT, "Farmland_with_zone.tif")
+ZONE_FILE = os.path.join(DATA_ROOT, "Export_Base_Farmland_Mask.tif")
 
 zone_ids = [1, 2, 3, 4]
 zone_names = ['bachu', 'zepu_yecheng', 'maigaiti', 'shache']
@@ -70,7 +71,7 @@ def main():
         print(f"Reading raster data for {years}...")
         img_arrs = []
         for y in years:
-            tif_path = os.path.join(DATA_ROOT, RF_FILE_TEMPLATE.format(year=y))
+            tif_path = os.path.join(RF_DATA_ROOT, RF_FILE_TEMPLATE.format(year=y))
             img_arrs.append(read_tif(tif_path))
 
         a_arr, b_arr, c_arr, d_arr, e_arr = img_arrs
@@ -85,12 +86,12 @@ def main():
                     (zone_arr == zid)
             )
 
-            # Extract valid pixels, shift to 0..5
-            a_v = a_arr[valid_mask] - 1
-            b_v = b_arr[valid_mask] - 1
-            c_v = c_arr[valid_mask] - 1
-            d_v = d_arr[valid_mask] - 1
-            e_v = e_arr[valid_mask] - 1
+            # Extract valid pixels, shift to 0..5 (强制转换为 int32 避免 uint8 溢出)
+            a_v = a_arr[valid_mask].astype(np.int32) - 1
+            b_v = b_arr[valid_mask].astype(np.int32) - 1
+            c_v = c_arr[valid_mask].astype(np.int32) - 1
+            d_v = d_arr[valid_mask].astype(np.int32) - 1
+            e_v = e_arr[valid_mask].astype(np.int32) - 1
 
             # Vectorized context and pair keys
             ctx_v = a_v * 216 + b_v * 36 + c_v * 6 + d_v
